@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spherical-unet"
+version = "0.1.0"
+description = "Spherical graph U-Net for fields on regular latitude-longitude grids (diffusion, consistency and flow-matching backbone)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Christian Wirths" }]
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "numpy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+legacy = ["scipy"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: longer than a few seconds"]
