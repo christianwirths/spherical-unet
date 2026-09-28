@@ -334,7 +334,7 @@ def test_cuda_forward():
     assert out.is_cuda and torch.isfinite(out).all()
 
 
-# --------------------------------------------------------------------- stage-2 additions
+# --------------------------------------------------------------------- execution paths, dtypes, validation
 
 @pytest.mark.parametrize("hw", [(6, 8), (6, 5), (4, 9)])
 def test_padded_conv2d_path_matches_gather_including_odd_width(hw):
@@ -354,15 +354,30 @@ def test_spherical_model_fast_path_matches_gather():
     t = torch.tensor([1.0, 50.0], dtype=torch.float64)
     with torch.no_grad():
         fast = model(x, t).sample
+        # Force the gather path on the spherical neighbour tables.
+        def table(hw):
+            return torch.from_numpy(build_equiangular_neighbours(*hw, "spherical"))
         for m in model.modules():
             if isinstance(m, GraphResNetBlock):
-                m.grid_hw = None
-        model.unet.decoder.final_hw = None
+                assert m.neigh_orders is None       # the fast path keeps no table
+                m.neigh_orders, m.grid_hw = table(m.grid_hw), None
+        dec = model.unet.decoder
+        dec.final_neigh, dec.final_hw = table(dec.final_hw), None
         slow = model(x, t).sample
     torch.testing.assert_close(fast, slow, rtol=0, atol=1e-12)
     # Longitude equivariance with an odd coarse width (roll by one coarse cell).
     with torch.no_grad():
         torch.testing.assert_close(model(x.roll(8, dims=-1), t).sample, fast.roll(8, dims=-1))
+
+
+def test_memory_efficient_flag_is_live():
+    model = _model(memory_efficient=True)
+    convs = [m for m in model.modules() if isinstance(m, DirectNeighConv)]
+    assert all(c.recompute for c in convs)
+    model.memory_efficient = False
+    assert not any(c.recompute for c in convs)
+    with pytest.warns(UserWarning):
+        _model(topology="spherical", memory_efficient=True)
 
 
 def test_memory_efficient_gives_same_gradients():
@@ -378,6 +393,9 @@ def test_memory_efficient_gives_same_gradients():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
 @pytest.mark.parametrize("times", [torch.tensor([1.0, 999.0]), torch.tensor([1, 999]), 7])
 def test_time_dtypes(dtype, times):
+    major, minor = (int(v) for v in torch.__version__.split(".")[:2])
+    if dtype == torch.float16 and (major, minor) < (2, 1):
+        pytest.skip("no fp16 matmul on CPU before torch 2.1")
     model = _model().to(dtype)
     out = model(torch.randn(2, 2, H, W, dtype=dtype), times).sample
     assert out.dtype == dtype and torch.isfinite(out.float()).all()

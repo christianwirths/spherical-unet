@@ -95,8 +95,8 @@ def widen_input_channels(state: Dict[str, torch.Tensor], n_old_in: int, n_new_in
         raise ValueError(f"{conv_key} has width {w.shape[1]}, expected "
                          f"{N_NEIGHBOURS * n_old_in} for n_old_in={n_old_in}")
     new = w.new_zeros((out_ch, N_NEIGHBOURS, n_new_in))
-    new[:, :, old_pos] = w.view(out_ch, N_NEIGHBOURS, n_old_in)
-    out[conv_key] = new.view(out_ch, N_NEIGHBOURS * n_new_in)
+    new[:, :, old_pos] = w.reshape(out_ch, N_NEIGHBOURS, n_old_in)
+    out[conv_key] = new.reshape(out_ch, N_NEIGHBOURS * n_new_in)
 
     # The residual shortcut is a Linear when in_ch != out_ch, else Identity.
     if n_new_in == out_ch:
@@ -121,6 +121,7 @@ def widen_input_channels(state: Dict[str, torch.Tensor], n_old_in: int, n_new_in
 @torch.no_grad()
 def verify_widening(model_old, model_new, images: torch.Tensor, times: torch.Tensor,
                     extra: Optional[torch.Tensor] = None, atol: float = 1e-5,
+                    generator: Optional[torch.Generator] = None,
                     **forward_kwargs) -> float:
     """Check that a model widened with *static* channels reproduces the original.
 
@@ -137,6 +138,10 @@ def verify_widening(model_old, model_new, images: torch.Tensor, times: torch.Ten
     with a tight ``atol``; round-off then shrinks by ~1e-9, a bug does not.
 
     Other keyword arguments (for example ``source=``) go to both models.
+    Both models are run in eval mode; their training flags are restored
+    afterwards. For widening with new *data* channels (``insert_at``),
+    compare the two models' outputs directly instead.
+
     Returns the maximum absolute difference; raises ``AssertionError`` above
     ``atol``.
     """
@@ -146,14 +151,20 @@ def verify_widening(model_old, model_new, images: torch.Tensor, times: torch.Ten
     if n_new <= n_old:
         raise ValueError(f"model_new must have more static channels than model_old "
                          f"({n_new} vs {n_old})")
-    model_old.eval()
-    model_new.eval()
     B, _, H, W = images.shape
     if extra is None:
-        extra = 10.0 * torch.randn(B, n_new, H, W, device=images.device, dtype=images.dtype)
-    ref = model_old(images, times, static=(extra[:, :n_old] if n_old else None),
-                    **forward_kwargs).sample
-    got = model_new(images, times, static=extra, **forward_kwargs).sample
+        extra = 10.0 * torch.randn(B, n_new, H, W, generator=generator,
+                                   device=images.device, dtype=images.dtype)
+    modes = (model_old.training, model_new.training)
+    model_old.eval()
+    model_new.eval()
+    try:
+        ref = model_old(images, times, static=(extra[:, :n_old] if n_old else None),
+                        **forward_kwargs).sample
+        got = model_new(images, times, static=extra, **forward_kwargs).sample
+    finally:
+        model_old.train(modes[0])
+        model_new.train(modes[1])
     diff = (ref - got).abs().max().item()
     if diff > atol:
         raise AssertionError(f"widened model does not reproduce the original: max |diff| "

@@ -11,7 +11,7 @@ can replace that model as the backbone of diffusion, consistency or
 flow-matching models. With a constant time it also works as a deterministic
 regression network (for example climate downscaling).
 
-- One self-contained file, [`src/spherical_unet/model.py`](src/spherical_unet/model.py),
+- One self-contained file, `src/spherical_unet/model.py`,
   that depends only on `torch` and `numpy`. Copy it into a project, or install
   the package.
 - Optional inputs: coordinate channels, static fields (orography, masks) that
@@ -40,8 +40,8 @@ without a dependency, copy that file into your project (here saved as
 from mypackage.spherical_unet import SphericalUNetWrapper
 ```
 
-`checkpoint.py` needs only `model.py` next to it (it imports `N_NEIGHBOURS`
-through a relative import).
+`checkpoint.py` imports `N_NEIGHBOURS` from `.model`, so vendor it together
+with an unrenamed `model.py` inside a package (or change that one import).
 
 ## Quick start
 
@@ -82,8 +82,9 @@ model.set_static_fields(static[0])              # [n_static, H, W]
 y = model(x, t).sample
 ```
 
-[`examples/minimal_denoiser.py`](examples/minimal_denoiser.py) trains a small
-denoiser on synthetic fields on CPU in about a minute.
+`examples/minimal_denoiser.py` trains a small
+denoiser on synthetic fields on CPU in under a minute (set `OMP_NUM_THREADS`
+on many-core machines).
 
 ## Architecture
 
@@ -140,8 +141,9 @@ in and out); relative speed on GPUs will differ.
 trained with it load and run unchanged. `"spherical"` is geometrically
 correct: `DirectNeighConv` on its graph equals a 3x3 `Conv2d` of the
 spherically padded field (which is how it is executed), and without
-coordinate channels the whole network is exactly equivariant to longitude
-rolls by multiples of the coarsest cell (both properties are tested). **Use `"spherical"` for new models.** The two
+coordinate channels the whole network is equivariant, up to float round-off,
+to longitude rolls by multiples of the coarsest cell (both properties are
+tested in float64). **Use `"spherical"` for new models.** The two
 modes share the same parameters, but the outputs differ everywhere once the
 receptive field has mixed in pole and seam values, so do not switch the mode
 of a trained model.
@@ -167,7 +169,7 @@ off.
 | `bypass_input_norm` | `False` | all inputs bypass the first GroupNorm |
 | `attn_heads` | `1` | heads of the mid-block attention |
 | `topology` | `"legacy"` | see above |
-| `memory_efficient` | `False` | recompute the neighbour gather in the backward pass (legacy path; about 9x less activation memory per conv, forward bitwise unchanged) |
+| `memory_efficient` | `False` | recompute the neighbour gathers in the backward pass (legacy path only; about 3x less activation memory for the whole model at about 13% more time; forward bitwise unchanged; not compatible with the Inductor backend of `torch.compile`) |
 
 Table 2: Constructor arguments of `SphericalUNetWrapper`. Channel counts are
 per grid cell; coordinates are in degrees.
@@ -202,8 +204,10 @@ Notes:
   them, still load with `strict=True`; the extra keys are dropped (into the
   wrapper or directly into `SphericalUNetCore`). The reverse direction, a new
   checkpoint into the original code, needs `strict=False`.
-  `tests/test_regression.py` checks against a golden fixture made with the
-  original code that `topology="legacy"` gives bit-identical outputs.
+  `tests/test_regression.py` compares `topology="legacy"` with a golden
+  fixture made with the original code. On the same machine and torch build
+  the outputs are bit-identical; across platforms float64 rounding differs by
+  about 1e-14, so the test uses an absolute tolerance of 1e-12.
 - `widen_input_channels(state, n_old_in, n_new_in, prefix="", insert_at=None)`
   adds zero-initialised input channels. By default they go after all old
   inputs, which is right for extra static fields. For new data channels, use
@@ -241,4 +245,4 @@ oversubscription can slow the CPU tests by orders of magnitude.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see the `LICENSE` file.

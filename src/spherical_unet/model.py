@@ -51,6 +51,7 @@ run north-to-south or south-to-north; the topology is symmetric.
 """
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -82,6 +83,12 @@ __all__ = [
 
 TOPOLOGIES = ("legacy", "spherical")
 N_NEIGHBOURS = 9
+
+
+def _is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    return bool(compiler is not None and hasattr(compiler, "is_compiling")
+                and compiler.is_compiling())
 
 
 def _check_topology(topology: str) -> None:
@@ -268,8 +275,9 @@ class DirectNeighConv(nn.Module):
       Linear. Works for any neighbour table (used for ``"legacy"``) and is
       bit-compatible with the original implementation. It materialises a
       ``[B, V, 9, F_in]`` tensor; set ``recompute=True`` to recompute it in
-      the backward pass instead of storing it (about 9x less activation
-      memory per conv for ~10% more time, forward bitwise unchanged).
+      the backward pass instead of storing it (forward bitwise unchanged).
+      ``recompute`` does not compile with the default Inductor backend of
+      ``torch.compile`` (use ``backend="aot_eager"`` or leave it off).
     - **padded conv2d** (``grid_hw=(H, W)``): the weight is reshaped to a
       ``[F_out, F_in, 3, 3]`` kernel and applied to the
       :func:`spherical_pad`-ded field. Equal (up to round-off) to the gather
@@ -289,7 +297,7 @@ class DirectNeighConv(nn.Module):
 
     def conv_kernel(self) -> torch.Tensor:
         """The weight as a ``[F_out, F_in, 3, 3]`` Conv2d kernel ("N" = row above)."""
-        w = self.weight.weight.view(self.out_ch, N_NEIGHBOURS, self.in_ch)
+        w = self.weight.weight.reshape(self.out_ch, N_NEIGHBOURS, self.in_ch)
         w = w[:, list(self.KERNEL_SLOTS)]                   # [F_out, 9, F_in]
         return w.transpose(1, 2).reshape(self.out_ch, self.in_ch, 3, 3)
 
@@ -386,7 +394,9 @@ class GraphResNetBlock(nn.Module):
                       if self.n_normed > 0 else None)
         self.conv1 = DirectNeighConv(in_ch, out_ch)
         # Rebuilt from the grid at construction, so not stored in checkpoints.
-        self.register_buffer("neigh_orders", neigh_orders, persistent=False)
+        # The padded-Conv2d path (grid_hw set) does not use the table at all.
+        self.register_buffer("neigh_orders", neigh_orders if grid_hw is None else None,
+                             persistent=False)
 
         self.time_emb_proj = nn.Linear(time_dim, out_ch)
 
@@ -637,8 +647,10 @@ class SphericalDecoder(nn.Module):
 
         self.final_norm = nn.GroupNorm(_gn_num_groups(channel_list[-1]), channel_list[-1])
         self.final = DirectNeighConv(channel_list[-1], out_channels)
-        self.register_buffer("final_neigh", neigh_orders_list[-1], persistent=False)
         self.final_hw = tuple(grid_dims[-1]) if topology == "spherical" else None
+        self.register_buffer("final_neigh",
+                             neigh_orders_list[-1] if self.final_hw is None else None,
+                             persistent=False)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         _drop_keys(state_dict, prefix, ("final_neigh",))
@@ -859,9 +871,22 @@ class SphericalUNetWrapper(nn.Module):
         self.register_buffer("_static_cache", None, persistent=False)
 
         self.memory_efficient = memory_efficient
+
+    @property
+    def memory_efficient(self) -> bool:
+        """Recompute the neighbour gathers in backward (see ``DirectNeighConv``)."""
+        return self._memory_efficient
+
+    @memory_efficient.setter
+    def memory_efficient(self, value: bool) -> None:
+        value = bool(value)
+        if value and self.topology == "spherical":
+            warnings.warn("memory_efficient has no effect with topology='spherical' "
+                          "(the padded-Conv2d path stores no gather)", stacklevel=2)
+        self._memory_efficient = value
         for m in self.modules():
             if isinstance(m, DirectNeighConv):
-                m.recompute = memory_efficient
+                m.recompute = value
 
     # Neighbour arrays are rebuilt from the grid at construction and are not
     # part of the state dict. Checkpoints of the original implementation
@@ -1006,7 +1031,11 @@ class SphericalUNetWrapper(nn.Module):
             if src.is_floating_point():
                 raise TypeError("source ids must be integers")
             src = self._broadcast_batch(src.long(), B, "source")
-            if bool((src >= self.n_sources).any()):
+            # Host-side check only where it is free: on CUDA it would sync
+            # every call (nn.Embedding still device-asserts), and under
+            # torch.compile it would break the graph.
+            if not src.is_cuda and not _is_compiling() \
+                    and bool((src >= self.n_sources).any()):
                 raise ValueError(f"source ids must be < n_sources={self.n_sources}")
             keep = (src >= 0).to(t_emb.dtype).unsqueeze(1)
             t_emb = t_emb + self.source_embed(src.clamp(min=0)) * keep

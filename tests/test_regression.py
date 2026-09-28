@@ -1,10 +1,17 @@
-"""Bit-compatibility with the original implementation.
+"""Compatibility with the original implementation.
 
 ``tests/data/legacy_golden.pt`` was generated once with the original code:
 float64 state dicts in the original checkpoint format (including the
 neighbour-table buffers it used to store), inputs and outputs, for a 16 x 40
 grid (coarsest level 2 x 5, odd width), plus one Chebyshev convolution with
-K = 3. ``topology="legacy"`` must reproduce the outputs bit for bit.
+K = 3.
+
+``topology="legacy"`` computes exactly the same operations as the original, so
+on one machine and torch build the outputs are bit-identical (verified when
+the fixture was made). Across BLAS builds and CPU instruction sets float64
+rounding differs by ~1e-14, so the stored outputs are compared with an
+absolute tolerance of 1e-12; any wiring or topology change gives errors of
+order 1e-2 or larger.
 """
 
 from pathlib import Path
@@ -15,20 +22,23 @@ import torch
 from spherical_unet import SphericalUNetCore, SphericalUNetWrapper
 from spherical_unet.legacy import cheb_conv
 
-GOLDEN = torch.load(Path(__file__).parent / "data" / "legacy_golden.pt", weights_only=False)
+GOLDEN = torch.load(Path(__file__).parent / "data" / "legacy_golden.pt", weights_only=True)
+TOL = dict(rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("name", sorted(GOLDEN["cases"]))
 @pytest.mark.parametrize("memory_efficient", [False, True])
-def test_legacy_outputs_are_bit_identical(name, memory_efficient):
+def test_legacy_outputs_match_golden(name, memory_efficient):
     case = GOLDEN["cases"][name]
     model = SphericalUNetWrapper(image_height=GOLDEN["H"], image_width=GOLDEN["W"],
                                  memory_efficient=memory_efficient,
                                  **case["config"]).double().eval()
     model.load_state_dict(case["state_dict"], strict=True)
-    with torch.no_grad():
-        out = model(case["images"], case["times"], **case["extra"]).sample
-    assert torch.equal(out, case["output"])
+    # Grad enabled, so memory_efficient actually runs the recompute path.
+    out = model(case["images"], case["times"], **case["extra"]).sample
+    torch.testing.assert_close(out.detach(), case["output"], **TOL)
+    out.square().sum().backward()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
 def test_legacy_core_subdict_loads_strictly():
@@ -41,7 +51,7 @@ def test_legacy_core_subdict_loads_strictly():
     model.unet.load_state_dict(sub, strict=True)
 
 
-def test_legacy_cheb_conv_is_bit_identical():
+def test_legacy_cheb_conv_matches_golden():
     c = GOLDEN["cheb"]
     out = cheb_conv(c["lap"].to_sparse(), c["x"], c["weight"])
-    assert torch.equal(out, c["output"])
+    torch.testing.assert_close(out, c["output"], **TOL)
