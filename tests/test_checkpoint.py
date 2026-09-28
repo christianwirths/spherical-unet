@@ -73,6 +73,41 @@ def test_verify_widening_helper():
         verify_widening(old, new, x, t, atol=1e-12)
 
 
+def test_verify_widening_with_existing_static():
+    old, new = _model(1).double(), _model(3).double()
+    new.load_state_dict(widen_input_channels(old.state_dict(), 6, 8), strict=True)
+    x = torch.randn(2, 3, H, W, dtype=torch.float64)
+    t = torch.ones(2, dtype=torch.float64)
+    assert verify_widening(old, new, x, t, atol=1e-12) < 1e-12
+    with pytest.raises(TypeError):
+        verify_widening(old, new, x, t, static=None)
+
+
+def test_widening_data_channel_with_insert_at():
+    # bypass_input_norm: no norm1, so a new *data* channel is possible; it sits
+    # before the coordinate channels, at index n_old_data = 3.
+    def m(n_data):
+        torch.manual_seed(1)
+        return SphericalUNetWrapper(in_channels=n_data, out_channels=2, image_height=H,
+                                    image_width=W, channel_list=(12, 16), spherical_depth=2,
+                                    time_emb_dim=8, use_coord_channels=True, coord_mode="lat",
+                                    bypass_input_norm=True).double().eval()
+    old, new = m(3), m(4)
+    new.load_state_dict(widen_input_channels(old.state_dict(), 5, 6, insert_at=3), strict=True)
+    x = torch.randn(2, 3, H, W, dtype=torch.float64)
+    x_new = torch.cat([x, 10 * torch.randn(2, 1, H, W, dtype=torch.float64)], dim=1)
+    t = torch.ones(2, dtype=torch.float64)
+    with torch.no_grad():
+        diff = (old(x, t).sample - new(x_new, t).sample).abs().max().item()
+    assert diff < 1e-12
+    # Appending instead (the default) mis-wires the coordinate weights.
+    new.load_state_dict(widen_input_channels(old.state_dict(), 5, 6), strict=True)
+    with torch.no_grad():
+        assert (old(x, t).sample - new(x_new, t).sample).abs().max().item() > 1e-3
+    with pytest.raises(ValueError):
+        widen_input_channels(old.state_dict(), 5, 6, insert_at=6)
+
+
 def test_widening_with_prefix_and_errors():
     old = _model(0)
     sd = {f"backbone.{k}": v for k, v in old.state_dict().items()}

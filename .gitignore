@@ -7,3 +7,6 @@ dist/
 .venv/
 *.pt
 *.ckpt
+
+# golden fixture generated from the original implementation
+!tests/data/*.pt

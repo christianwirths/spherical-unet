@@ -40,8 +40,10 @@ Topology modes (``topology`` argument of the wrapper):
     longitude either (it clamps at the seam).
   - ``"spherical"``: geometrically correct pole neighbours, post-upsample conv
     padded spherically (circular in longitude, pole-reflected in latitude) and
-    bilinear upsampling that is periodic in longitude and pole-aware. Use this
-    for new models trained from scratch.
+    bilinear upsampling that is periodic in longitude and pole-aware. The
+    ``DirectNeighConv`` layers then run as a ``Conv2d`` on the spherically
+    padded field (same operator, 2-3x faster, far less activation memory).
+    Use this for new models trained from scratch.
 
 The grid is assumed to be cell-centred (no row exactly on a pole): the row
 beyond a pole row is that pole row itself shifted by 180 degrees. Latitude may
@@ -56,6 +58,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 __all__ = [
     "SphericalUNetOutput",
@@ -218,18 +221,31 @@ def spherical_pad(x: torch.Tensor, pad: int = 1) -> torch.Tensor:
 
     Longitude is padded circularly. Latitude is padded by reflecting across
     each pole: padded row ``-k`` is row ``k - 1`` shifted by ``W // 2`` columns
-    (cell-centred grid). For odd ``W`` the shift ``W // 2`` is half a cell
-    short of the antipode, as in :func:`build_equiangular_neighbours`.
+    (cell-centred grid): padded column ``j`` holds column ``(j + W // 2) % W``,
+    exactly as in :func:`build_equiangular_neighbours`. For odd ``W`` that
+    is half a cell short of the antipode.
     """
     if pad == 0:
         return x
     H, W = x.shape[-2:]
     if pad > H:
         raise ValueError(f"pad ({pad}) larger than the number of rows ({H})")
-    top = x[..., :pad, :].flip(-2).roll(W // 2, dims=-1)
-    bottom = x[..., -pad:, :].flip(-2).roll(W // 2, dims=-1)
+    top = x[..., :pad, :].flip(-2).roll(-(W // 2), dims=-1)
+    bottom = x[..., -pad:, :].flip(-2).roll(-(W // 2), dims=-1)
     x = torch.cat([top, x, bottom], dim=-2)
     return F.pad(x, (pad, pad, 0, 0), mode="circular")
+
+
+def _graph_to_image(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """``[B, V, C]`` -> ``[B, C, H, W]`` (row-major vertices)."""
+    B, _, C = x.shape
+    return x.view(B, h, w, C).permute(0, 3, 1, 2)
+
+
+def _image_to_graph(x: torch.Tensor) -> torch.Tensor:
+    """``[B, C, H, W]`` -> ``[B, V, C]``."""
+    B, C = x.shape[:2]
+    return x.permute(0, 2, 3, 1).reshape(B, -1, C)
 
 
 # ---------------------------------------------------------------------------
@@ -245,24 +261,63 @@ class DirectNeighConv(nn.Module):
 
     The parameter is stored as ``self.weight`` (an ``nn.Linear``), so the
     state-dict keys are ``<name>.weight.weight`` and ``<name>.weight.bias``.
+
+    Two execution paths compute the same operator:
+
+    - **gather** (``grid_hw=None``): index with ``neigh_orders``, then the
+      Linear. Works for any neighbour table (used for ``"legacy"``) and is
+      bit-compatible with the original implementation. It materialises a
+      ``[B, V, 9, F_in]`` tensor; set ``recompute=True`` to recompute it in
+      the backward pass instead of storing it (about 9x less activation
+      memory per conv for ~10% more time, forward bitwise unchanged).
+    - **padded conv2d** (``grid_hw=(H, W)``): the weight is reshaped to a
+      ``[F_out, F_in, 3, 3]`` kernel and applied to the
+      :func:`spherical_pad`-ded field. Equal (up to round-off) to the gather
+      on the ``"spherical"`` table, 2-3x faster and much lighter in memory.
     """
+
+    # Neighbour slot of each 3x3 kernel position in row-major order:
+    # NW, N, NE / W, self, E / SW, S, SE.
+    KERNEL_SLOTS = (8, 1, 2, 7, 0, 3, 6, 5, 4)
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.weight = nn.Linear(N_NEIGHBOURS * in_ch, out_ch)
+        self.recompute = False
 
-    def forward(self, neigh_orders: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """``neigh_orders`` ``[V, 9]``, ``x`` ``[B, V, F_in]`` -> ``[B, V, F_out]``."""
+    def conv_kernel(self) -> torch.Tensor:
+        """The weight as a ``[F_out, F_in, 3, 3]`` Conv2d kernel ("N" = row above)."""
+        w = self.weight.weight.view(self.out_ch, N_NEIGHBOURS, self.in_ch)
+        w = w[:, list(self.KERNEL_SLOTS)]                   # [F_out, 9, F_in]
+        return w.transpose(1, 2).reshape(self.out_ch, self.in_ch, 3, 3)
+
+    def _gather_linear(self, neigh_orders: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         B, V, _ = x.shape
         mat = x[:, neigh_orders]                            # [B, V, 9, F_in]
         return self.weight(mat.reshape(B, V, N_NEIGHBOURS * self.in_ch))
+
+    def forward(self, neigh_orders: torch.Tensor, x: torch.Tensor,
+                grid_hw: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+        """``neigh_orders`` ``[V, 9]``, ``x`` ``[B, V, F_in]`` -> ``[B, V, F_out]``."""
+        if grid_hw is not None:
+            img = spherical_pad(_graph_to_image(x, *grid_hw), 1)
+            return _image_to_graph(F.conv2d(img, self.conv_kernel(), self.weight.bias))
+        if self.recompute and torch.is_grad_enabled():
+            return _checkpoint(self._gather_linear, neigh_orders, x, use_reentrant=False)
+        return self._gather_linear(neigh_orders, x)
 
 
 # ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
+
+def _drop_keys(state_dict, prefix: str, names) -> None:
+    """Remove ``prefix + name`` entries in place (legacy persistent buffers)."""
+    for name in names:
+        state_dict.pop(prefix + name, None)
+
 
 def _gn_num_groups(num_channels: int, preferred: int = 32) -> int:
     """Largest group count in (preferred, 16, 8, 4, 2, 1) dividing num_channels.
@@ -312,11 +367,16 @@ class GraphResNetBlock(nn.Module):
         neigh_orders: ``[V, 9]`` int64 neighbour indices at this level.
         time_dim:     Width of the time embedding.
         n_unnormed:   Trailing input channels that bypass ``norm1``.
+        grid_hw:      ``(H, W)`` of this level to run the convolutions as a
+                      spherically padded ``Conv2d`` (``"spherical"`` topology);
+                      ``None`` uses the neighbour gather.
     """
 
     def __init__(self, in_ch: int, out_ch: int, neigh_orders: torch.Tensor,
-                 time_dim: int, n_unnormed: int = 0):
+                 time_dim: int, n_unnormed: int = 0,
+                 grid_hw: Optional[Tuple[int, int]] = None):
         super().__init__()
+        self.grid_hw = tuple(grid_hw) if grid_hw is not None else None
         if not 0 <= n_unnormed <= in_ch:
             raise ValueError(f"n_unnormed must lie in [0, {in_ch}], got {n_unnormed}")
         self.n_unnormed = n_unnormed
@@ -335,6 +395,11 @@ class GraphResNetBlock(nn.Module):
 
         self.shortcut = nn.Linear(in_ch, out_ch) if in_ch != out_ch else nn.Identity()
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Checkpoints of the original implementation stored the table.
+        _drop_keys(state_dict, prefix, ("neigh_orders",))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         """``x`` ``[B, V, F_in]``, ``t_emb`` ``[B, D_time]`` -> ``[B, V, F_out]``."""
         residual = x
@@ -347,12 +412,12 @@ class GraphResNetBlock(nn.Module):
             h = torch.cat([h, extra], dim=-1)
         else:
             h = F.silu(_group_norm_graph(self.norm1, x))
-        h = self.conv1(self.neigh_orders, h)
+        h = self.conv1(self.neigh_orders, h, self.grid_hw)
 
         h = h + self.time_emb_proj(F.silu(t_emb)).unsqueeze(1)
 
         h = F.silu(_group_norm_graph(self.norm2, h))
-        h = self.conv2(self.neigh_orders, h)
+        h = self.conv2(self.neigh_orders, h, self.grid_hw)
 
         return h + self.shortcut(residual)
 
@@ -394,18 +459,6 @@ class GraphSelfAttention(nn.Module):
                                               heads(self.to_v(x)))
         attn = attn.transpose(1, 2).reshape(B, V, C)
         return self.to_out(attn) + residual
-
-
-def _graph_to_image(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
-    """``[B, V, C]`` -> ``[B, C, H, W]`` (row-major vertices)."""
-    B, _, C = x.shape
-    return x.view(B, h, w, C).permute(0, 3, 1, 2)
-
-
-def _image_to_graph(x: torch.Tensor) -> torch.Tensor:
-    """``[B, C, H, W]`` -> ``[B, V, C]``."""
-    B, C = x.shape[:2]
-    return x.permute(0, 2, 3, 1).reshape(B, -1, C)
 
 
 class AvgPool2dGraph(nn.Module):
@@ -502,12 +555,14 @@ class SphericalEncoder(nn.Module):
         time_dim:          Width of the time embedding.
         n_unnormed_first:  Trailing input channels of the very first block
                            that bypass its input GroupNorm.
+        topology:          ``"legacy"`` or ``"spherical"``.
     """
 
     def __init__(self, channel_list: List[int], neigh_orders_list: List[torch.Tensor],
                  grid_dims: List[Tuple[int, int]], time_dim: int = 16,
-                 n_unnormed_first: int = 0):
+                 n_unnormed_first: int = 0, topology: str = "legacy"):
         super().__init__()
+        _check_topology(topology)
         self.depth = len(channel_list) - 1
         if len(neigh_orders_list) < self.depth or len(grid_dims) < self.depth:
             raise ValueError(f"need at least {self.depth} grid levels, got "
@@ -520,9 +575,11 @@ class SphericalEncoder(nn.Module):
         self.level_blocks = nn.ModuleList()
         for i in range(self.depth):
             neigh = neigh_orders_list[-(i + 1)]          # finest -> coarser
+            hw = grid_dims[-(i + 1)] if topology == "spherical" else None
             b0 = GraphResNetBlock(channel_list[i], channel_list[i + 1], neigh, time_dim,
-                                  n_unnormed=(n_unnormed_first if i == 0 else 0))
-            b1 = GraphResNetBlock(channel_list[i + 1], channel_list[i + 1], neigh, time_dim)
+                                  n_unnormed=(n_unnormed_first if i == 0 else 0), grid_hw=hw)
+            b1 = GraphResNetBlock(channel_list[i + 1], channel_list[i + 1], neigh, time_dim,
+                                  grid_hw=hw)
             self.level_blocks.append(nn.ModuleList([b0, b1]))
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> List[torch.Tensor]:
@@ -567,19 +624,25 @@ class SphericalDecoder(nn.Module):
             coarse_hw = grid_dims[-(self.depth - i + 1)]
             fine_hw = grid_dims[-(self.depth - i)]
             neigh = neigh_orders_list[-(self.depth - i)]
+            hw = fine_hw if topology == "spherical" else None
             self.unpools.append(AvgUnpool2dGraph(*coarse_hw, topology=topology))
             self.upsample_convs.append(UpsampleConv2d(channel_list[i], *fine_hw,
                                                       topology=topology))
             in_ch = channel_list[i] + channel_list[i + 1]   # upsampled + skip
             out_ch = channel_list[i + 1]
             self.level_blocks.append(nn.ModuleList([
-                GraphResNetBlock(in_ch, out_ch, neigh, time_dim),
-                GraphResNetBlock(out_ch, out_ch, neigh, time_dim),
+                GraphResNetBlock(in_ch, out_ch, neigh, time_dim, grid_hw=hw),
+                GraphResNetBlock(out_ch, out_ch, neigh, time_dim, grid_hw=hw),
             ]))
 
         self.final_norm = nn.GroupNorm(_gn_num_groups(channel_list[-1]), channel_list[-1])
         self.final = DirectNeighConv(channel_list[-1], out_channels)
         self.register_buffer("final_neigh", neigh_orders_list[-1], persistent=False)
+        self.final_hw = tuple(grid_dims[-1]) if topology == "spherical" else None
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        _drop_keys(state_dict, prefix, ("final_neigh",))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, enc_outputs: List[torch.Tensor], t_emb: torch.Tensor) -> torch.Tensor:
         """``enc_outputs`` deepest first -> ``[B, V_finest, out_channels]``."""
@@ -590,7 +653,7 @@ class SphericalDecoder(nn.Module):
             for blk in blocks:
                 x = blk(x, t_emb)
         x = F.silu(_group_norm_graph(self.final_norm, x))
-        return self.final(self.final_neigh, x)
+        return self.final(self.final_neigh, x, self.final_hw)
 
 
 class SphericalUNetCore(nn.Module):
@@ -617,14 +680,17 @@ class SphericalUNetCore(nn.Module):
         super().__init__()
         self.encoder = SphericalEncoder(
             [in_features] + list(channel_list), neigh_orders_list, grid_dims,
-            time_dim=time_dim, n_unnormed_first=n_static,
+            time_dim=time_dim, n_unnormed_first=n_static, topology=topology,
         )
 
         deepest_ch = channel_list[-1]
         coarsest = neigh_orders_list[0]
-        self.mid_resnet1 = GraphResNetBlock(deepest_ch, deepest_ch, coarsest, time_dim)
+        hw = grid_dims[0] if topology == "spherical" else None
+        self.mid_resnet1 = GraphResNetBlock(deepest_ch, deepest_ch, coarsest, time_dim,
+                                            grid_hw=hw)
         self.mid_attention = GraphSelfAttention(deepest_ch, num_heads=attn_heads)
-        self.mid_resnet2 = GraphResNetBlock(deepest_ch, deepest_ch, coarsest, time_dim)
+        self.mid_resnet2 = GraphResNetBlock(deepest_ch, deepest_ch, coarsest, time_dim,
+                                            grid_hw=hw)
 
         self.decoder = SphericalDecoder(
             list(reversed(channel_list)), out_features, neigh_orders_list, grid_dims,
@@ -684,8 +750,10 @@ class SphericalUNetWrapper(nn.Module):
         coord_mode:         ``"latlon"`` (sin/cos lat and lon, 4 channels),
                             ``"lat"`` (sin/cos lat, 2) or ``"none"``.
         latitudes:          Optional row latitudes in degrees (length ``H``).
-                            Default: ``linspace(90, -90, H)`` (north first,
-                            end points on the poles), as in the original code.
+                            Default: north-first cell centres for
+                            ``topology="spherical"``; ``linspace(90, -90, H)``
+                            (end points on the poles, as in the original
+                            code) for ``"legacy"``.
         longitudes:         Optional column longitudes in degrees (length
                             ``W``). Default: ``0 .. 360 * (1 - 1/W)``.
         n_static_channels:  Number of static channels.
@@ -696,8 +764,12 @@ class SphericalUNetWrapper(nn.Module):
                             overriding the static-only split.
         attn_heads:         Heads of the mid-block self-attention.
         topology:           ``"legacy"`` (checkpoint compatible, default) or
-                            ``"spherical"`` (geometrically correct), see the
-                            module docstring.
+                            ``"spherical"`` (geometrically correct, faster),
+                            see the module docstring.
+        memory_efficient:   Recompute the neighbour gather of every
+                            ``DirectNeighConv`` in the backward pass instead
+                            of storing it (gather path only, i.e.
+                            ``"legacy"``). Forward is bitwise unchanged.
     """
 
     COORD_CHANNELS = {"latlon": 4, "lat": 2, "none": 0}
@@ -721,6 +793,7 @@ class SphericalUNetWrapper(nn.Module):
         bypass_input_norm: bool = False,
         attn_heads: int = 1,
         topology: str = "legacy",
+        memory_efficient: bool = False,
     ):
         super().__init__()
         if coord_mode not in self.COORD_CHANNELS:
@@ -740,6 +813,7 @@ class SphericalUNetWrapper(nn.Module):
         self.coord_mode = coord_mode
         self.n_static_channels = n_static_channels
         self.use_source_token = use_source_token
+        self.n_sources = n_sources
         self.bypass_input_norm = bypass_input_norm
         self.topology = topology
 
@@ -784,21 +858,19 @@ class SphericalUNetWrapper(nn.Module):
         # Optional cached static field [n_static, H, W] (see set_static_fields).
         self.register_buffer("_static_cache", None, persistent=False)
 
-    # Neighbour arrays are rebuilt from the grid at construction and are not
-    # part of the state dict. Checkpoints written by the original
-    # implementation stored them (``_neigh_<i>``, ``*.neigh_orders``,
-    # ``*.final_neigh``); drop those keys so such checkpoints still load with
-    # ``strict=True``.
-    _LEGACY_BUFFER_SUFFIXES = (".neigh_orders", ".final_neigh")
+        self.memory_efficient = memory_efficient
+        for m in self.modules():
+            if isinstance(m, DirectNeighConv):
+                m.recompute = memory_efficient
 
+    # Neighbour arrays are rebuilt from the grid at construction and are not
+    # part of the state dict. Checkpoints of the original implementation
+    # stored them (``_neigh_<i>`` here, ``neigh_orders`` / ``final_neigh`` in
+    # the blocks, which drop their own); drop them so such checkpoints still
+    # load with ``strict=True``. The reverse (a new checkpoint into the
+    # original code) needs ``strict=False``.
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        for key in list(state_dict):
-            if not key.startswith(prefix):
-                continue
-            local = key[len(prefix):]
-            if (local.startswith("_neigh_")
-                    or (local.startswith("unet.") and local.endswith(self._LEGACY_BUFFER_SUFFIXES))):
-                del state_dict[key]
+        _drop_keys(state_dict, prefix, [f"_neigh_{i}" for i in range(self.n_levels)])
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _build_coord_features(self, H: int, W: int,
@@ -810,7 +882,9 @@ class SphericalUNetWrapper(nn.Module):
         keeps the first two, so it is a prefix of ``"latlon"``. All values lie
         in [-1, 1].
         """
-        if latitudes is None:
+        if latitudes is None and self.topology == "spherical":
+            lat_rad = torch.deg2rad(90.0 - 180.0 * (torch.arange(H) + 0.5) / H)
+        elif latitudes is None:
             lat_rad = torch.linspace(math.pi / 2, -math.pi / 2, H)
         else:
             lat_rad = torch.deg2rad(torch.as_tensor(latitudes, dtype=torch.float32))
@@ -904,18 +978,36 @@ class SphericalUNetWrapper(nn.Module):
                 static = self._static_cache
             if static.dim() == 3:
                 static = static.unsqueeze(0)
+            if static.dim() != 4 or static.shape[1:] != (self.n_static_channels, H, W):
+                raise ValueError(f"static must be [B, {self.n_static_channels}, {H}, {W}], "
+                                 f"got {tuple(static.shape)}")
             static = self._broadcast_batch(static, B, "static")
-            s = static.to(x.dtype).permute(0, 2, 3, 1).reshape(B, V, self.n_static_channels)
+            s = _image_to_graph(static.to(device=x.device, dtype=x.dtype))
             x = torch.cat([x, s], dim=2)
 
-        times = self._broadcast_batch(torch.as_tensor(times, device=images.device), B, "times")
-        t_emb = self.time_mlp(self.time_embed(times))                 # [B, D_time]
+        times = torch.as_tensor(times, device=images.device)
+        if times.dim() > 1:
+            if times.numel() != times.shape[0]:
+                raise ValueError(f"times must be scalar, [1] or [B], got {tuple(times.shape)}")
+            times = times.reshape(times.shape[0])
+        times = self._broadcast_batch(times, B, "times")
+        # The sinusoid is computed in float32 (float64 for a double model) and
+        # only then cast to the parameter dtype: fp16/bf16 cannot resolve the
+        # high frequencies at t ~ 1000, and integer steps must work too.
+        param_dtype = self.time_mlp[0].weight.dtype
+        emb_dtype = torch.float64 if param_dtype == torch.float64 else torch.float32
+        t_emb = self.time_embed(times.to(emb_dtype)).to(param_dtype)
+        t_emb = self.time_mlp(t_emb)                                  # [B, D_time]
 
         # Added after the MLP, so a zero-initialised embedding leaves t_emb
         # bit-identical to the token-free model.
         if self.use_source_token and source is not None:
-            src = self._broadcast_batch(
-                torch.as_tensor(source, device=t_emb.device).long(), B, "source")
+            src = torch.as_tensor(source, device=t_emb.device)
+            if src.is_floating_point():
+                raise TypeError("source ids must be integers")
+            src = self._broadcast_batch(src.long(), B, "source")
+            if bool((src >= self.n_sources).any()):
+                raise ValueError(f"source ids must be < n_sources={self.n_sources}")
             keep = (src >= 0).to(t_emb.dtype).unsqueeze(1)
             t_emb = t_emb + self.source_embed(src.clamp(min=0)) * keep
 

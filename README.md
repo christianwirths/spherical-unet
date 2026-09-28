@@ -22,7 +22,7 @@ regression network (for example climate downscaling).
 ## Install
 
 ```bash
-pip install git+https://github.com/<user>/spherical-unet.git
+pip install git+https://github.com/christianwirths/spherical-unet.git
 # or, from a checkout
 pip install -e ".[test]"
 ```
@@ -33,7 +33,8 @@ optional legacy Chebyshev layers (`pip install -e ".[legacy]"`).
 ### Vendoring
 
 `model.py` imports nothing from the rest of the package. To use the network
-without a dependency, copy that file into your project:
+without a dependency, copy that file into your project (here saved as
+`mypackage/spherical_unet.py`):
 
 ```python
 from mypackage.spherical_unet import SphericalUNetWrapper
@@ -57,17 +58,21 @@ model = SphericalUNetWrapper(
 )
 
 x = torch.randn(2, 3, 176, 360)
-t = torch.tensor([10.0, 500.0])                 # diffusion step / noise level per sample
-y = model(x, t).sample                          # [2, 3, 176, 360]
+t = torch.tensor([10, 500])                     # diffusion step / noise level per sample
+with torch.no_grad():                           # training at this size needs a GPU
+    y = model(x, t).sample                      # [2, 3, 176, 360]
 ```
 
 With static fields and a source token:
 
 ```python
+lats_deg = torch.linspace(89.5, -89.5, 176)     # row latitudes of your grid
+static = torch.rand(2, 3, 176, 360)             # e.g. orography, land fraction, ice mask
+
 model = SphericalUNetWrapper(
     in_channels=3, out_channels=3, image_height=176, image_width=360,
     use_coord_channels=True, coord_mode="lat", latitudes=lats_deg,
-    n_static_channels=3,                        # e.g. orography, land fraction, ice mask
+    n_static_channels=3,
     use_source_token=True, n_sources=2,
     topology="spherical",
 )
@@ -112,7 +117,8 @@ everywhere, so train and eval mode behave the same.
 
 For a 176 x 360 grid at depth 4 the levels are 176x360, 88x180, 44x90 and
 22x45 (990 vertices for the attention). Default widths `(128, 128, 256, 256)`
-with `time_emb_dim=64` give about 14 M parameters for 16 input channels.
+with `time_emb_dim=64` give about 14.5 M parameters (14,485,193 for 3 input and
+3 output channels).
 
 ## Topology: `"legacy"` vs `"spherical"`
 
@@ -122,16 +128,20 @@ with `time_emb_dim=64` give about 14 M parameters for 16 input channels.
 | Pole diagonals | mirrored (NE -> `j + W//2 - 1`) | geometric (NE -> `j + W//2 + 1`) |
 | Post-upsample 3x3 conv padding | circular in lon **and lat** (the two pole rows see each other) | circular in lon, pole-reflected in lat |
 | Bilinear upsampling | clamps at every edge | periodic in lon, pole-aware |
+| `DirectNeighConv` execution | neighbour gather | 3x3 `Conv2d` of the padded field |
+| Forward + backward time, 88x176, B=2 | 921 ms | 437 ms |
 
-Table 1: How the two topology modes treat the grid boundaries. `j` is the
-column index and `W` the number of columns.
+Table 1: How the two topology modes treat the grid boundaries, and their
+cost. `j` is the column index and `W` the number of columns. Timings are wall
+time in milliseconds on 4 CPU threads (widths `(32, 64, 64, 128)`, 3 channels
+in and out); relative speed on GPUs will differ.
 
 `"legacy"` reproduces the original implementation **bit for bit**, so weights
 trained with it load and run unchanged. `"spherical"` is geometrically
 correct: `DirectNeighConv` on its graph equals a 3x3 `Conv2d` of the
-spherically padded field, and without coordinate channels the whole network
-is exactly equivariant to longitude rolls by multiples of the coarsest cell
-(both properties are tested). **Use `"spherical"` for new models.** The two
+spherically padded field (which is how it is executed), and without
+coordinate channels the whole network is exactly equivariant to longitude
+rolls by multiples of the coarsest cell (both properties are tested). **Use `"spherical"` for new models.** The two
 modes share the same parameters, but the outputs differ everywhere once the
 receptive field has mixed in pole and seam values, so do not switch the mode
 of a trained model.
@@ -157,6 +167,7 @@ off.
 | `bypass_input_norm` | `False` | all inputs bypass the first GroupNorm |
 | `attn_heads` | `1` | heads of the mid-block attention |
 | `topology` | `"legacy"` | see above |
+| `memory_efficient` | `False` | recompute the neighbour gather in the backward pass (legacy path; about 9x less activation memory per conv, forward bitwise unchanged) |
 
 Table 2: Constructor arguments of `SphericalUNetWrapper`. Channel counts are
 per grid cell; coordinates are in degrees.
@@ -167,10 +178,13 @@ Notes:
   2 pi x 10^4. That suits integer diffusion steps (0 to 1000) or EDM noise
   levels. For a flow-matching time in [0, 1], multiply it by about 1000 first,
   otherwise most embedding dimensions barely change.
-- **Default coordinates.** Without `latitudes`, the latitude channels use
-  `linspace(90, -90, H)`: north first, with the end points on the poles. This
-  matches the original implementation. For a cell-centred or south-first grid,
-  pass the real row latitudes.
+- **Default coordinates.** Without `latitudes`, the latitude channels assume
+  north-first rows: cell centres for `"spherical"`, and `linspace(90, -90, H)`
+  (end points on the poles, as in the original implementation) for
+  `"legacy"`. For a south-first grid, pass the real row latitudes.
+- **Dtypes.** The sinusoidal time embedding is computed in float32 (float64
+  for a double model) and then cast to the parameter dtype, so `.half()` and
+  `.bfloat16()` models accept float or integer timesteps.
 - **Input normalisation.** GroupNorm is invariant to a per-sample shift,
   `GN(x + c) = GN(x)`. With a normalised first block, the network sees a
   uniform offset of the input (for example a global-mean temperature change)
@@ -185,14 +199,21 @@ Notes:
 
 - The neighbour tables are rebuilt from the grid, so they are not stored in the
   state dict. Checkpoints from the original implementation, which did store
-  them, still load with `strict=True`; the extra keys are dropped.
-- `widen_input_channels(state, n_old_in, n_new_in, prefix="")` adds new input
-  channels, zero-initialised, after all the old ones (for example extra static
-  fields). It relocates the neighbour-major `conv1` columns and extends the
-  residual shortcut, so the widened model reproduces the old one **exactly**,
-  whatever the new channels contain. `verify_widening` checks this. The new
-  channels must bypass the first GroupNorm (static channels, or
-  `bypass_input_norm=True`).
+  them, still load with `strict=True`; the extra keys are dropped (into the
+  wrapper or directly into `SphericalUNetCore`). The reverse direction, a new
+  checkpoint into the original code, needs `strict=False`.
+  `tests/test_regression.py` checks against a golden fixture made with the
+  original code that `topology="legacy"` gives bit-identical outputs.
+- `widen_input_channels(state, n_old_in, n_new_in, prefix="", insert_at=None)`
+  adds zero-initialised input channels. By default they go after all old
+  inputs, which is right for extra static fields. For new data channels, use
+  `insert_at=n_old_data`. It relocates the neighbour-major `conv1` columns and
+  extends the residual shortcut. The widened model then reproduces the old one
+  exactly (up to float round-off), whatever the new channels contain.
+  `verify_widening` checks this for added static channels. The new channels
+  must bypass the first GroupNorm (static channels, or
+  `bypass_input_norm=True`). A wrong `insert_at` still loads without error, so
+  always verify.
 
 ```python
 from spherical_unet import widen_input_channels, verify_widening

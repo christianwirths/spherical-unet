@@ -332,3 +332,84 @@ def test_cuda_forward():
     out = model(torch.randn(2, 2, H, W, device="cuda"), torch.ones(2, device="cuda"),
                 static=torch.rand(2, 1, H, W, device="cuda")).sample
     assert out.is_cuda and torch.isfinite(out).all()
+
+
+# --------------------------------------------------------------------- stage-2 additions
+
+@pytest.mark.parametrize("hw", [(6, 8), (6, 5), (4, 9)])
+def test_padded_conv2d_path_matches_gather_including_odd_width(hw):
+    h, w = hw
+    torch.manual_seed(0)
+    conv = DirectNeighConv(3, 4).double()
+    neigh = torch.from_numpy(build_equiangular_neighbours(h, w, "spherical"))
+    x = torch.randn(2, h * w, 3, dtype=torch.float64)
+    torch.testing.assert_close(conv(neigh, x, grid_hw=(h, w)), conv(neigh, x))
+
+
+def test_spherical_model_fast_path_matches_gather():
+    # 16 x 40 at depth 4: coarsest level 2 x 5 (odd width).
+    kw = dict(image_height=16, image_width=40, channel_list=(8, 8, 16, 16), spherical_depth=4)
+    model = _model(topology="spherical", **kw).double().eval()
+    x = torch.randn(2, 2, 16, 40, dtype=torch.float64)
+    t = torch.tensor([1.0, 50.0], dtype=torch.float64)
+    with torch.no_grad():
+        fast = model(x, t).sample
+        for m in model.modules():
+            if isinstance(m, GraphResNetBlock):
+                m.grid_hw = None
+        model.unet.decoder.final_hw = None
+        slow = model(x, t).sample
+    torch.testing.assert_close(fast, slow, rtol=0, atol=1e-12)
+    # Longitude equivariance with an odd coarse width (roll by one coarse cell).
+    with torch.no_grad():
+        torch.testing.assert_close(model(x.roll(8, dims=-1), t).sample, fast.roll(8, dims=-1))
+
+
+def test_memory_efficient_gives_same_gradients():
+    x, t = torch.randn(2, 2, H, W), torch.rand(2) * 10
+    grads = []
+    for flag in (False, True):
+        model = _model(memory_efficient=flag)
+        model(x, t).sample.square().mean().backward()
+        grads.append(torch.cat([p.grad.flatten() for p in model.parameters()]))
+    torch.testing.assert_close(grads[0], grads[1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+@pytest.mark.parametrize("times", [torch.tensor([1.0, 999.0]), torch.tensor([1, 999]), 7])
+def test_time_dtypes(dtype, times):
+    model = _model().to(dtype)
+    out = model(torch.randn(2, 2, H, W, dtype=dtype), times).sample
+    assert out.dtype == dtype and torch.isfinite(out.float()).all()
+
+
+def test_times_column_vector_and_bad_shapes():
+    model = _model().eval()
+    x = torch.randn(2, 2, H, W)
+    with torch.no_grad():
+        a = model(x, torch.tensor([[3.0], [4.0]])).sample
+        b = model(x, torch.tensor([3.0, 4.0])).sample
+    torch.testing.assert_close(a, b)
+    with pytest.raises(ValueError):
+        model(x, torch.ones(2, 2))
+
+
+def test_static_and_source_validation():
+    model = _model(n_static_channels=2, use_source_token=True, n_sources=2)
+    x, t = torch.randn(2, 2, H, W), torch.ones(2)
+    with pytest.raises(ValueError):
+        model(x, t, static=torch.rand(2, 3, H, W))
+    with pytest.raises(ValueError):
+        model(x, t, static=torch.rand(2, 2, H, W + 2))
+    s = torch.rand(2, 2, H, W)
+    with pytest.raises(ValueError):
+        model(x, t, static=s, source=torch.tensor([0, 2]))
+    with pytest.raises(TypeError):
+        model(x, t, static=s, source=torch.tensor([0.0, 1.0]))
+
+
+def test_spherical_default_latitudes_are_cell_centres():
+    model = _model(topology="spherical", use_coord_channels=True, coord_mode="lat")
+    sin_lat = model._coord_features.view(H, W, 2)[:, 0, 0]
+    expected = torch.sin(torch.deg2rad(90 - 180 * (torch.arange(H) + 0.5) / H))
+    torch.testing.assert_close(sin_lat, expected)
